@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import asyncio, json, math, os, time
-from collections import defaultdict, deque
+import asyncio, json, math, os, time, heapq
+from collections import defaultdict
 import websockets
 
 UPBIT_WS="wss://api.upbit.com/websocket/v1"
@@ -17,9 +17,13 @@ PAPER_QTY_BTC=float(os.getenv("PAPER_QTY_BTC","0.01"))
 LAT_MS=[50,100,200,500]
 
 quotes={}
-stats=defaultdict(lambda:{"checks":0,"pos":0,"max_bp":-1e9,"sum_pos_bp":0.0,"episodes":0})
+stats=defaultdict(lambda:{"checks":0,"pos":0,"max_bp":-1e9,"sum_pos_bp":0.0,"episodes":0,
+                          "start_bp_sum":0.0,"start_paper_sum":0.0,"max_profit_sum":0.0,
+                          "cap_ge_0001":0,"cap_ge_0005":0,"cap_ge_001":0,"cap_ge_005":0})
+lat_stats=defaultdict(lambda:{"n":0,"pos":0,"sum_bp":0.0,"sum_paper":0.0,"max_bp":-1e9})
 active={}
-pending=deque()
+pending=[]
+pending_seq=0
 start_mono=time.monotonic()
 last_summary=start_mono
 
@@ -67,7 +71,7 @@ def calc(now):
     return out
 
 def process_edges():
-    global last_summary
+    global last_summary, pending_seq
     n=now_ns();mono=time.monotonic()
     edges={name:(bp,cap,krw) for name,bp,cap,krw in calc(n)}
     for name,(bp,cap,krw) in edges.items():
@@ -77,30 +81,64 @@ def process_edges():
             if name not in active:
                 active[name]={"start_ns":n,"start_bp":bp,"max_bp":bp,"cap":cap}
                 s["episodes"]+=1
+                paper=krw*min(cap,PAPER_QTY_BTC)
+                maxprofit=krw*cap
+                s["start_bp_sum"]+=bp; s["start_paper_sum"]+=paper; s["max_profit_sum"]+=maxprofit
+                if cap>=0.001: s["cap_ge_0001"]+=1
+                if cap>=0.005: s["cap_ge_0005"]+=1
+                if cap>=0.01: s["cap_ge_001"]+=1
+                if cap>=0.05: s["cap_ge_005"]+=1
                 print("EDGE_START",json.dumps({"route":name,"bp":bp,"cap_btc":cap,
-                    "net_krw_per_btc":krw,"paper_net_krw":krw*min(cap,PAPER_QTY_BTC)},separators=(",",":")),flush=True)
-                for lat in LAT_MS: pending.append((n+lat*1_000_000,name,lat))
+                    "net_krw_per_btc":krw,"paper_net_krw":paper,"max_top_level_profit_krw":maxprofit},separators=(",",":")),flush=True)
+                for lat in LAT_MS:
+                    pending_seq+=1
+                    heapq.heappush(pending,(n+lat*1_000_000,pending_seq,n,name,lat))
             else:
                 active[name]["max_bp"]=max(active[name]["max_bp"],bp)
         elif name in active:
             a=active.pop(name)
             print("EDGE_END",json.dumps({"route":name,"duration_ms":(n-a["start_ns"])/1e6,
                 "start_bp":a["start_bp"],"max_bp":a["max_bp"]},separators=(",",":")),flush=True)
-    while pending and pending[0][0]<=n:
-        _,name,lat=pending.popleft()
-        if name in edges:
-            bp,cap,krw=edges[name]
-            print("LATENCY",json.dumps({"route":name,"lat_ms":lat,"bp":bp,"positive":bp>0,
-                "cap_btc":cap,"paper_net_krw":krw*min(cap,PAPER_QTY_BTC)},separators=(",",":")),flush=True)
     if mono-last_summary>=SUMMARY_SEC:
         payload={}
         for k,s in stats.items():
-            payload[k]={"episodes":s["episodes"],"positive_checks":s["pos"],
+            ep=s["episodes"]
+            lats={}
+            for lat in LAT_MS:
+                z=lat_stats[(k,lat)]
+                lats[str(lat)]={"n":z["n"],"pos_rate":(z["pos"]/z["n"] if z["n"] else None),
+                    "mean_bp":(z["sum_bp"]/z["n"] if z["n"] else None),
+                    "mean_paper_krw":(z["sum_paper"]/z["n"] if z["n"] else None),
+                    "max_bp":None if z["max_bp"]<-1e8 else z["max_bp"]}
+            payload[k]={"episodes":ep,"positive_checks":s["pos"],
                 "max_bp":None if s["max_bp"]<-1e8 else s["max_bp"],
-                "mean_positive_bp":(s["sum_pos_bp"]/s["pos"] if s["pos"] else None)}
+                "mean_positive_bp":(s["sum_pos_bp"]/s["pos"] if s["pos"] else None),
+                "mean_start_bp":(s["start_bp_sum"]/ep if ep else None),
+                "mean_start_paper_krw":(s["start_paper_sum"]/ep if ep else None),
+                "mean_max_top_level_profit_krw":(s["max_profit_sum"]/ep if ep else None),
+                "cap_ge_0001":s["cap_ge_0001"],"cap_ge_0005":s["cap_ge_0005"],
+                "cap_ge_001":s["cap_ge_001"],"cap_ge_005":s["cap_ge_005"],
+                "latency":lats}
         print("SUMMARY",json.dumps({"uptime_sec":mono-start_mono,"routes":payload,
             "ages_ms":{k:(n-v["recv_ns"])/1e6 for k,v in quotes.items()}},separators=(",",":")),flush=True)
         last_summary=mono
+
+async def latency_worker():
+    while True:
+        await asyncio.sleep(0.005)
+        n=now_ns()
+        while pending and pending[0][0]<=n:
+            due,_,start_ns,name,lat=heapq.heappop(pending)
+            edges={route:(bp,cap,krw) for route,bp,cap,krw in calc(n)}
+            if name not in edges:
+                continue
+            bp,cap,krw=edges[name]
+            actual=(n-start_ns)/1e6
+            paper=krw*min(cap,PAPER_QTY_BTC)
+            z=lat_stats[(name,lat)]
+            z["n"]+=1; z["pos"]+=1 if bp>0 else 0; z["sum_bp"]+=bp; z["sum_paper"]+=paper; z["max_bp"]=max(z["max_bp"],bp)
+            print("LATENCY",json.dumps({"route":name,"lat_ms":lat,"actual_ms":actual,"bp":bp,
+                "positive":bp>0,"cap_btc":cap,"paper_net_krw":paper},separators=(",",":")),flush=True)
 
 async def upbit():
     sub=[{"ticket":"arb-live"},{"type":"orderbook","codes":["KRW-BTC.1","KRW-USDT.1"],"is_only_realtime":True},{"format":"DEFAULT"}]
@@ -153,7 +191,7 @@ async def heartbeat():
 async def main():
     print("LIVE_ARB_START",json.dumps({"upbit_fee_bp":UPBIT_FEE_BP,"bithumb_coupon_bp":BITHUMB_COUPON_FEE_BP,
       "bithumb_base_bp":BITHUMB_BASE_FEE_BP,"binance_fee_bp":BINANCE_FEE_BP,"paper_qty_btc":PAPER_QTY_BTC}),flush=True)
-    await asyncio.gather(upbit(),bithumb(),binance(),heartbeat())
+    await asyncio.gather(upbit(),bithumb(),binance(),heartbeat(),latency_worker())
 
 if __name__=="__main__":
     asyncio.run(main())
