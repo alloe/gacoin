@@ -8,18 +8,15 @@ BITHUMB_WS="wss://ws-api.bithumb.com/websocket/v1"
 BINANCE_WS=os.getenv("BINANCE_WS","wss://data-stream.binance.vision/ws/btcusdt@bookTicker")
 
 UPBIT_FEE_BP=float(os.getenv("UPBIT_FEE_BP","5"))
-BITHUMB_COUPON_FEE_BP=float(os.getenv("BITHUMB_COUPON_FEE_BP","4"))
 BITHUMB_BASE_FEE_BP=float(os.getenv("BITHUMB_BASE_FEE_BP","25"))
-BITHUMB_FREE_FEE_BP=float(os.getenv("BITHUMB_FREE_FEE_BP","0"))
 BINANCE_FEE_BP=float(os.getenv("BINANCE_FEE_BP","10"))
-BINANCE_BNB_FEE_BP=float(os.getenv("BINANCE_BNB_FEE_BP","7.5"))
 SUMMARY_SEC=int(os.getenv("SUMMARY_SEC","60"))
 BUCKET_SUMMARY_SEC=int(os.getenv("BUCKET_SUMMARY_SEC","600"))
 MAX_STALE_MS=float(os.getenv("MAX_STALE_MS","1000"))
 PAPER_QTY_BTC=float(os.getenv("PAPER_QTY_BTC","0.01"))
 LAT_MS=[50,100,200,500]
-EDGE_BUCKETS=[(0.0,0.5,"0-0.5"),(0.5,1.0,"0.5-1"),(1.0,1.5,"1-1.5"),(1.5,2.0,"1.5-2"),(2.0,3.0,"2-3"),(3.0,None,"3+")]
-EDGE_CUTOFFS=[0.5,1.0,1.5,2.0,3.0]
+EDGE_BUCKETS=[(0.0,0.5,"0-0.5"),(0.5,1.0,"0.5-1"),(1.0,2.0,"1-2"),(2.0,3.0,"2-3"),(3.0,5.0,"3-5"),(5.0,7.5,"5-7.5"),(7.5,10.0,"7.5-10"),(10.0,None,"10+")]
+EDGE_CUTOFFS=[0.5,1.0,2.0,3.0,5.0,7.5,10.0]
 
 quotes={}
 stats=defaultdict(lambda:{"checks":0,"pos":0,"max_bp":-1e9,"sum_pos_bp":0.0,"episodes":0,
@@ -102,38 +99,30 @@ def make_bucket_summary(uptime_h):
 
 def calc(now):
     out=[]
-    # Upbit <-> Bithumb, two fee scenarios for Bithumb
+    # Standard-fee only: Upbit <-> Bithumb (5bp + 25bp)
     if fresh("UP_BTC",now) and fresh("BH_BTC",now):
-        u=quotes["UP_BTC"];b=quotes["BH_BTC"]
-        for label,bhf in [("coupon",BITHUMB_COUPON_FEE_BP),("base",BITHUMB_BASE_FEE_BP),("free",BITHUMB_FREE_FEE_BP)]:
-            e1=net_edge_bp(b["bid"],u["ask"],bhf,UPBIT_FEE_BP)
-            e2=net_edge_bp(u["bid"],b["ask"],UPBIT_FEE_BP,bhf)
-            out.append((f"UPbuy_BHsell_{label}",e1,min(u["asksz"],b["bidsz"]),b["bid"]*(1-bhf/10000)-u["ask"]*(1+UPBIT_FEE_BP/10000)))
-            out.append((f"BHbuy_UPsell_{label}",e2,min(b["asksz"],u["bidsz"]),u["bid"]*(1-UPBIT_FEE_BP/10000)-b["ask"]*(1+bhf/10000)))
+        u=quotes["UP_BTC"];b=quotes["BH_BTC"];bhf=BITHUMB_BASE_FEE_BP
+        e1=net_edge_bp(b["bid"],u["ask"],bhf,UPBIT_FEE_BP)
+        e2=net_edge_bp(u["bid"],b["ask"],UPBIT_FEE_BP,bhf)
+        out.append(("UPbuy_BHsell_standard",e1,min(u["asksz"],b["bidsz"]),b["bid"]*(1-bhf/10000)-u["ask"]*(1+UPBIT_FEE_BP/10000)))
+        out.append(("BHbuy_UPsell_standard",e2,min(b["asksz"],u["bidsz"]),u["bid"]*(1-UPBIT_FEE_BP/10000)-b["ask"]*(1+bhf/10000)))
     # Binance conversions using Upbit KRW-USDT top of book
     if fresh("UP_USDT",now) and fresh("BN_BTC",now):
         fx=quotes["UP_USDT"];bn=quotes["BN_BTC"]
         if fresh("UP_BTC",now):
-            u=quotes["UP_BTC"]
+            u=quotes["UP_BTC"];bnf=BINANCE_FEE_BP
             bn_sell_krw=bn["bid"]*fx["bid"];bn_buy_krw=bn["ask"]*fx["ask"]
-            for suffix,bnf in [("",BINANCE_FEE_BP),("_bnb",BINANCE_BNB_FEE_BP)]:
-                e1=net_edge_bp(bn_sell_krw,u["ask"],bnf,UPBIT_FEE_BP)
-                e2=net_edge_bp(u["bid"],bn_buy_krw,UPBIT_FEE_BP,bnf)
-                out.append((f"UPbuy_BNsell{suffix}",e1,min(u["asksz"],bn["bidsz"]),bn_sell_krw*(1-bnf/10000)-u["ask"]*(1+UPBIT_FEE_BP/10000)))
-                out.append((f"BNbuy_UPsell{suffix}",e2,min(bn["asksz"],u["bidsz"]),u["bid"]*(1-UPBIT_FEE_BP/10000)-bn_buy_krw*(1+bnf/10000)))
+            e1=net_edge_bp(bn_sell_krw,u["ask"],bnf,UPBIT_FEE_BP)
+            e2=net_edge_bp(u["bid"],bn_buy_krw,UPBIT_FEE_BP,bnf)
+            out.append(("UPbuy_BNsell_standard",e1,min(u["asksz"],bn["bidsz"]),bn_sell_krw*(1-bnf/10000)-u["ask"]*(1+UPBIT_FEE_BP/10000)))
+            out.append(("BNbuy_UPsell_standard",e2,min(bn["asksz"],u["bidsz"]),u["bid"]*(1-UPBIT_FEE_BP/10000)-bn_buy_krw*(1+bnf/10000)))
         if fresh("BH_BTC",now):
             b=quotes["BH_BTC"];bn_sell_krw=bn["bid"]*fx["bid"];bn_buy_krw=bn["ask"]*fx["ask"]
-            for label,bhf in [("coupon",BITHUMB_COUPON_FEE_BP),("base",BITHUMB_BASE_FEE_BP),("free",BITHUMB_FREE_FEE_BP)]:
-                e1=net_edge_bp(bn_sell_krw,b["ask"],BINANCE_FEE_BP,bhf)
-                e2=net_edge_bp(b["bid"],bn_buy_krw,bhf,BINANCE_FEE_BP)
-                out.append((f"BHbuy_BNsell_{label}",e1,min(b["asksz"],bn["bidsz"]),bn_sell_krw*(1-BINANCE_FEE_BP/10000)-b["ask"]*(1+bhf/10000)))
-                out.append((f"BNbuy_BHsell_{label}",e2,min(bn["asksz"],b["bidsz"]),b["bid"]*(1-bhf/10000)-bn_buy_krw*(1+BINANCE_FEE_BP/10000)))
-            for label,bhf in [("coupon",BITHUMB_COUPON_FEE_BP),("free",BITHUMB_FREE_FEE_BP)]:
-                bnf=BINANCE_BNB_FEE_BP
-                e1=net_edge_bp(bn_sell_krw,b["ask"],bnf,bhf)
-                e2=net_edge_bp(b["bid"],bn_buy_krw,bhf,bnf)
-                out.append((f"BHbuy_BNsell_{label}_bnb",e1,min(b["asksz"],bn["bidsz"]),bn_sell_krw*(1-bnf/10000)-b["ask"]*(1+bhf/10000)))
-                out.append((f"BNbuy_BHsell_{label}_bnb",e2,min(bn["asksz"],b["bidsz"]),b["bid"]*(1-bhf/10000)-bn_buy_krw*(1+bnf/10000)))
+            bhf=BITHUMB_BASE_FEE_BP;bnf=BINANCE_FEE_BP
+            e1=net_edge_bp(bn_sell_krw,b["ask"],bnf,bhf)
+            e2=net_edge_bp(b["bid"],bn_buy_krw,bhf,bnf)
+            out.append(("BHbuy_BNsell_standard",e1,min(b["asksz"],bn["bidsz"]),bn_sell_krw*(1-bnf/10000)-b["ask"]*(1+bhf/10000)))
+            out.append(("BNbuy_BHsell_standard",e2,min(bn["asksz"],b["bidsz"]),b["bid"]*(1-bhf/10000)-bn_buy_krw*(1+bnf/10000)))
     return out
 
 def process_edges():
@@ -198,9 +187,8 @@ def process_edges():
     if mono-last_bucket_summary>=BUCKET_SUMMARY_SEC:
         uptime_h=(mono-start_mono)/3600.0
         print("BUCKET_SUMMARY",json.dumps({"uptime_sec":mono-start_mono,"routes":make_bucket_summary(uptime_h),
-            "fee_bp":{"upbit":UPBIT_FEE_BP,"bithumb_coupon":BITHUMB_COUPON_FEE_BP,
-                      "bithumb_free":BITHUMB_FREE_FEE_BP,"binance":BINANCE_FEE_BP,
-                      "binance_bnb":BINANCE_BNB_FEE_BP}},separators=(",",":")),flush=True)
+            "fee_bp":{"upbit_standard":UPBIT_FEE_BP,"bithumb_standard":BITHUMB_BASE_FEE_BP,
+                      "binance_standard":BINANCE_FEE_BP}},separators=(",",":")),flush=True)
         last_bucket_summary=mono
 
 async def latency_worker():
@@ -271,10 +259,9 @@ async def heartbeat():
         await asyncio.sleep(5);process_edges()
 
 async def main():
-    print("LIVE_ARB_START",json.dumps({"mode":"paper_only_no_order_api","upbit_fee_bp":UPBIT_FEE_BP,
-      "bithumb_coupon_bp":BITHUMB_COUPON_FEE_BP,"bithumb_base_bp":BITHUMB_BASE_FEE_BP,
-      "bithumb_free_bp":BITHUMB_FREE_FEE_BP,"binance_fee_bp":BINANCE_FEE_BP,
-      "binance_bnb_fee_bp":BINANCE_BNB_FEE_BP,"paper_qty_btc":PAPER_QTY_BTC,
+    print("LIVE_ARB_START",json.dumps({"mode":"paper_only_standard_fees_no_order_api",
+      "upbit_standard_bp":UPBIT_FEE_BP,"bithumb_standard_bp":BITHUMB_BASE_FEE_BP,
+      "binance_standard_bp":BINANCE_FEE_BP,"paper_qty_btc":PAPER_QTY_BTC,
       "bucket_summary_sec":BUCKET_SUMMARY_SEC}),flush=True)
     await asyncio.gather(upbit(),bithumb(),binance(),heartbeat(),latency_worker())
 
