@@ -5,7 +5,7 @@ import requests, numpy as np
 
 START=os.getenv("BT_START","2025-10-01T00:00:00Z")
 END=os.getenv("BT_END","2026-09-22T00:00:00Z")
-INTERVAL_MIN=10
+INTERVAL_MIN=15
 UP_FEE_BP=5.0
 BN_FUT_TAKER_BP=5.0
 SLIP_RT_BP=float(os.getenv("SLIP_RT_BP","4"))
@@ -37,7 +37,7 @@ def upbit(market):
 def bn_fut(sym,mult):
     out={};cur=START_MS;calls=0
     while cur<END_MS:
-        r=S.get("https://fapi.binance.com/fapi/v1/klines",params={"symbol":sym,"interval":"10m","startTime":cur,"endTime":END_MS-1,"limit":1500},timeout=30)
+        r=S.get("https://fapi.binance.com/fapi/v1/klines",params={"symbol":sym,"interval":"15m","startTime":cur,"endTime":END_MS-1,"limit":1500},timeout=30)
         if r.status_code!=200:raise RuntimeError(f"BN {sym} {r.status_code} {r.text[:120]}")
         a=r.json();calls+=1
         if not a:break
