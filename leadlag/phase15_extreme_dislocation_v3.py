@@ -228,7 +228,11 @@ def add(acc,key,pnl,cap,meta=None):
         for k,v in meta.items():g[k]+=v
 
 def summarize(g):
-    if not g['n']:return {'n':0}
+    if not g['n']:
+        return {'n':0,'mean_bp':None,'median_bp':None,'win_rate':None,'pf':None,'sum_bp':None,
+                'p05_bp':None,'p95_bp':None,'median_l1_capacity_krw':None,
+                'targets':g.get('targets',0),'stops':g.get('stops',0),'timeouts':g.get('timeouts',0),
+                'fills':g.get('fills',0),'signals':g.get('signals',0)}
     a=np.asarray(g['vals'],float)
     return {'n':g['n'],'mean_bp':g['sum']/g['n'],'median_bp':float(np.median(a)),'win_rate':g['win']/g['n'],
             'pf':g['pos']/g['neg'] if g['neg']>0 else None,'sum_bp':g['sum'],
@@ -364,7 +368,7 @@ def main():
                   'cells_n_ge15':sum(r['n']>=15 for r in pos),
                   'cells_n_ge30':sum(r['n']>=30 for r in pos),
                   'max_n':max([r['n'] for r in pos],default=0),
-                  'max_signals':max([r['signals'] for r in rows if r['direction']==1],default=0)}
+                  'max_signals':max([r.get('signals',0) for r in rows if r['direction']==1],default=0)}
     log('V3_SAMPLE_STATS',**sample_stats)
     pos.sort(key=lambda r:r['mean_bp'],reverse=True)
     for r in pos[:80]:log('V3_ANY',**r)
