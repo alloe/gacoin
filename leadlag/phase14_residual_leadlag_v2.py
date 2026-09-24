@@ -114,6 +114,7 @@ def ret_bp(x,w):
 
 def metrics(vals):
     a=np.asarray(vals,float)
+    a=a[np.isfinite(a)]
     if len(a)==0:return {'n':0}
     pos=a[a>0].sum(); neg=-a[a<0].sum()
     return {'n':int(len(a)),'mean_bp':float(a.mean()),'median_bp':float(np.median(a)),
@@ -136,13 +137,13 @@ def pnl_taker(up,fu,fx,i,j,d):
     fxe=float(fx[i]); fxx=float(fx[j])
     if d==1:
         ue=float(up[i,2]); ux=float(up[j,0]); fe=float(fu[i,0]); fz=float(fu[j,2])
-        if min(ue,ux,fe,fz,fxe,fxx)<=0:return None
+        if not all(math.isfinite(v) and v>0 for v in (ue,ux,fe,fz,fxe,fxx)):return None
         q=1.0/ue
         pnl=q*(ux*(1-UF)-ue*(1+UF))+q*(fe*(1-FF)-fz*(1+FF))*fxx
         cap=min(float(up[i,3])*ue,float(fu[i,1])*fe*fxe)
     else:
         ue=float(up[i,0]); ux=float(up[j,2]); fe=float(fu[i,2]); fz=float(fu[j,0])
-        if min(ue,ux,fe,fz,fxe,fxx)<=0:return None
+        if not all(math.isfinite(v) and v>0 for v in (ue,ux,fe,fz,fxe,fxx)):return None
         q=1.0/ue
         pnl=q*(ue*(1-UF)-ux*(1+UF))+q*(fz*(1-FF)-fe*(1+FF))*fxx
         cap=min(float(up[i,1])*ue,float(fu[i,3])*fe*fxe)
@@ -284,19 +285,21 @@ def aggregate(rows):
     groups={}
     for r in rows:
         k=(r['variant'],r['profile'],r['window_ms'],r['direction'],r['latency_ms_effective'],r['horizon_ms'])
-        g=groups.setdefault(k,{'pn':[],'caps':[],'signals':0,'touch_num':0,'touch_den':0})
-        # aggregate per-cell means weighted by trade count is impossible from metrics alone; save compact approximation
+        g=groups.setdefault(k,{'caps':[],'signals':0,'touch_num':0,'touch_den':0,'n':0,'sum_bp':0.0,'wins':0.0,'coin_days':0})
         m=r['metrics']; n=int(m.get('n',0)); g['signals']+=int(r.get('signals',0))
-        if n and m.get('mean_bp') is not None:
-            g['pn'].extend([float(m['mean_bp'])]*n)
+        if n and m.get('sum_bp') is not None and m.get('win_rate') is not None:
+            g['n']+=n; g['sum_bp']+=float(m['sum_bp']); g['wins']+=float(m['win_rate'])*n; g['coin_days']+=1
         if r.get('median_l1_capacity_krw') is not None:g['caps'].append(float(r['median_l1_capacity_krw']))
         if r['variant']=='B_maker_touch' and r.get('touch_rate') is not None:
             g['touch_num']+=n;g['touch_den']+=int(r.get('signals',0))
     out=[]
     for k,g in groups.items():
-        v,p,w,d,lat,h=k
+        v,p,w,d,lat,h=k; n=g['n']
         out.append({'variant':v,'profile':p,'window_ms':w,'direction':d,'latency_ms_effective':lat,'horizon_ms':h,
-                    'signals':g['signals'],'approx_metrics':metrics(g['pn']),
+                    'signals':g['signals'],'trades':n,
+                    'weighted_mean_bp':g['sum_bp']/n if n else None,
+                    'weighted_win_rate':g['wins']/n if n else None,
+                    'sum_bp':g['sum_bp'] if n else None,'contributing_coin_days':g['coin_days'],
                     'median_of_coin_day_l1_capacity_krw':float(np.median(g['caps'])) if g['caps'] else None,
                     'touch_rate':g['touch_num']/g['touch_den'] if g['touch_den'] else None})
     return out
@@ -315,8 +318,8 @@ def main():
             log('V2_DATE_FATAL',date=d,error=repr(e),traceback=traceback.format_exc()[-1800:])
     agg=aggregate(allrows)
     # emit best descriptive cells by positive-direction feasible path and minimum 20 approximate trades
-    feasible=[x for x in agg if x['direction']==1 and x['approx_metrics'].get('n',0)>=20]
-    feasible.sort(key=lambda x:(x['approx_metrics'].get('mean_bp') if x['approx_metrics'].get('mean_bp') is not None else -1e9),reverse=True)
+    feasible=[x for x in agg if x['direction']==1 and x.get('trades',0)>=20]
+    feasible.sort(key=lambda x:(x.get('weighted_mean_bp') if x.get('weighted_mean_bp') is not None else -1e9),reverse=True)
     for x in feasible[:40]: log('V2_RESULT',**x)
     summary={'dates_requested':DATES,'dates_completed':sorted(set(r['date'] for r in allrows)),
              'coins_requested':COINS,'result_rows':len(allrows),'aggregate_cells':len(agg),'failures':failures,
