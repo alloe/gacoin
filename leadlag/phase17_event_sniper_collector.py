@@ -25,6 +25,7 @@ POST_MS=int(os.getenv('EVENT_POST_MS','30000'))
 TRIGGER_BP=float(os.getenv('EVENT_TRIGGER_BP','30'))
 COOLDOWN_MS=int(os.getenv('EVENT_COOLDOWN_MS','30000'))
 MAX_STALE_MS=float(os.getenv('EVENT_MAX_STALE_MS','750'))
+FX_MAX_STALE_MS=float(os.getenv('EVENT_FX_MAX_STALE_MS','10000'))
 SUMMARY_SEC=int(os.getenv('EVENT_SUMMARY_SEC','60'))
 CHUNK_ROWS=int(os.getenv('EVENT_CHUNK_ROWS','40'))
 R=requests.Session();R.headers['User-Agent']='daol-event-sniper-collector/17'
@@ -87,8 +88,8 @@ def qput(store,c,bid,bidsz,ask,asksz,src_ts=None):
 
 def mid(q):return (q['bid']+q['ask'])/2
 
-def fresh(q,n):
-    return q is not None and (n-q['mono_ns'])/1e6<=MAX_STALE_MS
+def fresh(q,n,max_age_ms=MAX_STALE_MS):
+    return q is not None and (n-q['mono_ns'])/1e6<=max_age_ms
 
 def past_row(c,delta_ms):
     h=hist[c]
@@ -127,8 +128,8 @@ async def sampler():
         tick_start=time.monotonic()
         n=now_mono_ns();wall=now_wall_ns()
         fq=quotes_up.get('USDT')
-        if fresh(fq,n):fx=fq
-        fxm=mid(fx) if fresh(fx,n) else None
+        if fresh(fq,n,FX_MAX_STALE_MS):fx=fq
+        fxm=mid(fx) if fresh(fx,n,FX_MAX_STALE_MS) else None
         # common premium from all fresh aligned markets
         prems=[];snap={}
         if fxm:
@@ -175,7 +176,7 @@ async def sampler():
             print('COLLECTOR_SUMMARY '+json.dumps({
               'uptime_sec':time.monotonic()-start_mono,'universe':len(universe),'aligned_now':len(snap),
               'events_total':events_total,'active_events':len(active),'samples_total':samples_total,
-              'fx_fresh':bool(fxm),'trigger_bp':TRIGGER_BP},separators=(',',':')),flush=True)
+              'fx_fresh':bool(fxm),'fx_max_stale_ms':FX_MAX_STALE_MS,'trigger_bp':TRIGGER_BP},separators=(',',':')),flush=True)
             last_summary=time.monotonic()
         elapsed=(time.monotonic()-tick_start)*1000
         await asyncio.sleep(max(.001,(SAMPLE_MS-elapsed)/1000))
