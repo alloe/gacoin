@@ -268,8 +268,9 @@ def run_date(date,acc):
             w=max(1,win_ms//STEP_MS);br=ret_bp(fm,w);ur=ret_bp(um,w);lag=br-ur
             # prior BTC 500ms impulse ending one 500ms block before current time
             btclead=np.zeros(len(fm),bool)
+            bprev=np.full(len(fm),np.nan)
             if c!='BTC' and btc_fm is not None:
-                bw=max(1,500//STEP_MS);bprev=np.full(len(fm),np.nan)
+                bw=max(1,500//STEP_MS)
                 if 2*bw<len(fm):
                     ok=np.isfinite(btc_fm[bw:-bw])&np.isfinite(btc_fm[:-2*bw])&(btc_fm[:-2*bw]>0)
                     tmp=np.full(len(fm)-2*bw,np.nan);tmp[ok]=np.log(btc_fm[bw:-bw][ok]/btc_fm[:-2*bw][ok])*10000
