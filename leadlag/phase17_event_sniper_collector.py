@@ -39,6 +39,7 @@ samples_total=0
 start_mono=time.monotonic()
 universe=[]
 bn_symbol={}
+bn_mult={}
 
 def now_wall_ns():return time.time_ns()
 def now_mono_ns():return time.monotonic_ns()
@@ -61,8 +62,9 @@ def choose_universe():
     futures={x['symbol'] for x in ex['symbols'] if x.get('contractType')=='PERPETUAL' and x.get('quoteAsset')=='USDT' and x.get('status')=='TRADING'}
     mp={}
     for m in krw:
-        c=m[4:];opts=[c+'USDT','1000'+c+'USDT','1000000'+c+'USDT']
-        found=[s for s in opts if s in futures]
+        c=m[4:]
+        opts=[(c+'USDT',1.0),('1000'+c+'USDT',1000.0),('1000000'+c+'USDT',1000000.0)]
+        found=[x for x in opts if x[0] in futures]
         if len(found)==1:mp[c]=found[0]
     # Upbit ticker batches to avoid long URLs
     tick=[]
@@ -77,7 +79,7 @@ def choose_universe():
         if c in mp:chosen.append(c)
         if len(chosen)>=N:break
     if len(chosen)<20:raise RuntimeError('too few matched live markets')
-    return chosen,{c:mp[c] for c in chosen}
+    return chosen,{c:mp[c][0] for c in chosen},{c:mp[c][1] for c in chosen}
 
 def qput(store,c,bid,bidsz,ask,asksz,src_ts=None):
     try:b=float(bid);bs=float(bidsz);a=float(ask);az=float(asksz)
@@ -112,7 +114,7 @@ def emit_event(ev):
       'trigger_mono_ns':ev['trigger_mono_ns'],'trigger_reason':ev['reason'],
       'trigger_ret500_bp':ev['r500'],'trigger_ret1000_bp':ev['r1000'],
       'pre_ms':PRE_MS,'post_ms':POST_MS,'sample_ms':SAMPLE_MS,'rows':len(rows),
-      'binance_symbol':bn_symbol.get(ev['coin']),
+      'binance_symbol':bn_symbol.get(ev['coin']),'binance_multiplier':bn_mult.get(ev['coin'],1.0),
       'schema':['dt_ms','up_bid','up_ask','up_bidsz','up_asksz','bn_bid','bn_ask','bn_bidsz','bn_asksz',
                 'fx_mid','premium_bp','residual_bp','bn_ret500_bp','bn_ret1000_bp','up_ret500_bp','up_ret1000_bp',
                 'up_src_ts','bn_src_ts','up_age_ms','bn_age_ms']},separators=(',',':')),flush=True)
@@ -207,13 +209,16 @@ async def binance_ws():
                     d=json.loads(raw)
                     if not all(k in d for k in ('s','b','B','a','A')):continue
                     sym=d['s'];c=next((x for x in universe if bn_symbol[x]==sym),None)
-                    if c:qput(quotes_bn,c,d['b'],d['B'],d['a'],d['A'],d.get('E') or d.get('T'))
+                    if c:
+                        mult=bn_mult.get(c,1.0)
+                        qput(quotes_bn,c,float(d['b'])/mult,float(d['B'])*mult,
+                             float(d['a'])/mult,float(d['A'])*mult,d.get('E') or d.get('T'))
         except Exception as e:
             print('COLLECTOR_WS_ERR binance '+repr(e),flush=True);await asyncio.sleep(1)
 
 async def main():
-    global universe,bn_symbol
-    universe,bn_symbol=await asyncio.to_thread(choose_universe)
+    global universe,bn_symbol,bn_mult
+    universe,bn_symbol,bn_mult=await asyncio.to_thread(choose_universe)
     print('EVENT_COLLECTOR_START '+json.dumps({'mode':'public_l1_no_orders','n':len(universe),'coins':universe,
       'sample_ms':SAMPLE_MS,'pre_ms':PRE_MS,'post_ms':POST_MS,'trigger_bp':TRIGGER_BP,
       'storage':'Railway logs EVENT_META/EVENT_CHUNK'},separators=(',',':')),flush=True)
