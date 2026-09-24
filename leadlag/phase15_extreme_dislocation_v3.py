@@ -357,18 +357,31 @@ def main():
         v,p,w,d,ng,lat,exitmode,h=k;s=summarize(g)
         rows.append({'variant':v,'profile':p,'window_ms':w,'direction':d,'net_gate_bp':ng,'latency_ms':lat,
                      'exit_mode':exitmode,'horizon_ms':h,**s})
-    # feasible direction only, minimum 15 actual trades; show top by mean, then stricter >=30 separately
-    feasible=[r for r in rows if r['direction']==1 and r['n']>=15]
-    feasible.sort(key=lambda r:r['mean_bp'],reverse=True)
-    for r in feasible[:60]:log('V3_RESULT',**r)
-    robust=[r for r in rows if r['direction']==1 and r['n']>=30]
-    robust.sort(key=lambda r:r['mean_bp'],reverse=True)
-    for r in robust[:30]:log('V3_ROBUST',**r)
-    research=[r for r in rows if r['direction']==-1 and r['n']>=15]
+    pos=[r for r in rows if r['direction']==1 and r['n']>0]
+    sample_stats={'cells_n_gt0':len(pos),
+                  'cells_n_ge5':sum(r['n']>=5 for r in pos),
+                  'cells_n_ge10':sum(r['n']>=10 for r in pos),
+                  'cells_n_ge15':sum(r['n']>=15 for r in pos),
+                  'cells_n_ge30':sum(r['n']>=30 for r in pos),
+                  'max_n':max([r['n'] for r in pos],default=0),
+                  'max_signals':max([r['signals'] for r in rows if r['direction']==1],default=0)}
+    log('V3_SAMPLE_STATS',**sample_stats)
+    pos.sort(key=lambda r:r['mean_bp'],reverse=True)
+    for r in pos[:80]:log('V3_ANY',**r)
+    for threshold,tag,limit in ((5,'V3_N5',50),(10,'V3_N10',40),(15,'V3_N15',30)):
+        z=[r for r in rows if r['direction']==1 and r['n']>=threshold]
+        z.sort(key=lambda r:r['mean_bp'],reverse=True)
+        for r in z[:limit]:log(tag,**r)
+    # one best cell per variant among non-empty feasible-direction cells
+    for v in sorted(set(r['variant'] for r in pos)):
+        z=[r for r in pos if r['variant']==v]
+        z.sort(key=lambda r:r['mean_bp'],reverse=True)
+        if z:log('V3_VARIANT_BEST',**z[0])
+    research=[r for r in rows if r['direction']==-1 and r['n']>0]
     research.sort(key=lambda r:r['mean_bp'],reverse=True)
     for r in research[:20]:log('V3_RESEARCH_SHORT',**r)
     summary={'dates_completed':DATES if not failures else [d for d in DATES if d not in {x['date'] for x in failures}],
-             'result_cells':len(rows),'failures':failures,'production_pass':False,
+             'result_cells':len(rows),'sample_stats':sample_stats,'failures':failures,'production_pass':False,
              'reason':'Historical L1 screening only; V4 maker fills are touch/cross proxies without queue position. No L2, true fills, liquidation, or untouched future validation.'}
     (ROOT/'phase15_results.json').write_text(json.dumps(clean(rows)))
     log('V3_BT_DONE',**summary)
