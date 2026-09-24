@@ -241,7 +241,7 @@ def summarize(g):
             'targets':g.get('targets',0),'stops':g.get('stops',0),'timeouts':g.get('timeouts',0),
             'fills':g.get('fills',0),'signals':g.get('signals',0)}
 
-def run_date(date,acc):
+def run_date(date,acc,funnel):
     log('V3_DATE_START',date=date)
     fxq=quote_grid('upbit',date,'KRW-USDT');fx=mid(fxq)
     work=ROOT/date;work.mkdir(exist_ok=True)
@@ -282,9 +282,36 @@ def run_date(date,acc):
             for d in (1,-1):
                 rex=executable_residual(up,fu,fx,common,d);net=est_net_edge(rex,uhs,fhs,d)
                 gross=(-rex if d==1 else rex)
+                # Maker-entry residual uses Upbit passive price but Binance hedge remains taker.
+                rm=np.full(len(fx),np.nan)
+                if d==1:
+                    mnum=up[:,0].astype(float);mden=fu[:,0].astype(float)*fx
+                else:
+                    mnum=up[:,2].astype(float);mden=fu[:,2].astype(float)*fx
+                mok=np.isfinite(mnum)&np.isfinite(mden)&np.isfinite(common)&(mnum>0)&(mden>0)
+                rm[mok]=np.log(mnum[mok]/mden[mok])*10000-common[mok]
+                mgross=(-rm if d==1 else rm)
+                mnet=mgross-(2*UF+2*FF)*10000-uhs-fhs
                 for pname,shock_th,lag_th,gross_th in PROFILES:
-                    base=np.isfinite(br)&np.isfinite(lag)&np.isfinite(gross)&np.isfinite(net)
-                    base&=(d*br>=shock_th)&(d*lag>=lag_th)&(gross>=gross_th)
+                    finite=np.isfinite(br)&np.isfinite(lag)&np.isfinite(gross)&np.isfinite(net)
+                    shock=finite&(d*br>=shock_th)
+                    shocklag=shock&(d*lag>=lag_th)
+                    base=shocklag&(gross>=gross_th)
+                    mfinite=np.isfinite(br)&np.isfinite(lag)&np.isfinite(mgross)&np.isfinite(mnet)
+                    mshock=mfinite&(d*br>=shock_th)
+                    mshocklag=mshock&(d*lag>=lag_th)
+                    mbase=mshocklag&(mgross>=gross_th)
+                    fk=(pname,win_ms,d)
+                    fg=funnel[fk]
+                    fg['shock']+=len(collapse(shock));fg['shock_lag']+=len(collapse(shocklag))
+                    fg['taker_gross']+=len(collapse(base));fg['maker_gross']+=len(collapse(mbase))
+                    if np.any(np.isfinite(net)&shocklag):
+                        fg['max_taker_net']=max(fg['max_taker_net'],float(np.nanmax(np.where(shocklag,net,np.nan))))
+                    if np.any(np.isfinite(mnet)&mshocklag):
+                        fg['max_maker_net']=max(fg['max_maker_net'],float(np.nanmax(np.where(mshocklag,mnet,np.nan))))
+                    for ng0 in (0.,10.,20.,30.):
+                        fg['taker_net_'+str(int(ng0))]+=len(collapse(base&(net>=ng0)))
+                        fg['maker_net_'+str(int(ng0))]+=len(collapse(mbase&(mnet>=ng0)))
                     for ng in NET_GATES:
                         gate=base&(net>=ng)
                         variants={
@@ -304,7 +331,6 @@ def run_date(date,acc):
                                         i=int(s+ls);j=i+hs
                                         x=taker_pnl(up,fu,fx,i,j,d)
                                         if x:add(acc,key,x[0],x[1])
-                                # dynamic convergence exit
                                 key=(vname,pname,win_ms,d,ng,lat,'target',MAX_TARGET_MS)
                                 acc[key]['signals']+=len(sig)
                                 for s in sig:
@@ -314,21 +340,22 @@ def run_date(date,acc):
                                     if j is None:continue
                                     x=taker_pnl(up,fu,fx,i,j,d)
                                     if x:add(acc,key,x[0],x[1],{reason+'s':1})
-                        # V4 maker variants from same extreme event; no artificial latency before posting.
-                        sig=collapse(gate)
+                        # V4 has its OWN maker edge gate rather than inheriting taker economics.
+                        mgate=mbase&(mnet>=ng)
+                        msig=collapse(mgate)
                         for mode in ('touch','cross'):
                             for horizon in (5000,10000,30000):
                                 key=('V4_maker_'+mode,pname,win_ms,d,ng,None,'fixed',horizon)
-                                acc[key]['signals']+=len(sig)
-                                for s in sig:
+                                acc[key]['signals']+=len(msig)
+                                for s in msig:
                                     f=maker_fill(up,int(s),d,mode)
                                     if not f:continue
                                     fill,mp=f;j=fill+max(1,horizon//STEP_MS)
                                     x=maker_pnl(up,fu,fx,fill,mp,j,d)
                                     if x:add(acc,key,x[0],x[1],{'fills':1})
                             key=('V4_maker_'+mode,pname,win_ms,d,ng,None,'target',MAX_TARGET_MS)
-                            acc[key]['signals']+=len(sig)
-                            for s in sig:
+                            acc[key]['signals']+=len(msig)
+                            for s in msig:
                                 f=maker_fill(up,int(s),d,mode)
                                 if not f:continue
                                 fill,mp=f;j,reason=target_exit(up,fu,fx,common,fill,d)
@@ -350,9 +377,13 @@ def main():
         variants=['V3_extreme','V3_btc_leader','V3_imbalance','V4_maker_touch','V4_maker_cross'])
     acc=defaultdict(lambda:{'n':0,'sum':0.,'win':0,'pos':0.,'neg':0.,'vals':[],'caps':[],
                             'signals':0,'fills':0,'targets':0,'stops':0,'timeouts':0})
+    funnel=defaultdict(lambda:{'shock':0,'shock_lag':0,'taker_gross':0,'maker_gross':0,
+                              'taker_net_0':0,'taker_net_10':0,'taker_net_20':0,'taker_net_30':0,
+                              'maker_net_0':0,'maker_net_10':0,'maker_net_20':0,'maker_net_30':0,
+                              'max_taker_net':-1e9,'max_maker_net':-1e9})
     failures=[]
     for d in DATES:
-        try:run_date(d,acc)
+        try:run_date(d,acc,funnel)
         except Exception as e:
             failures.append({'date':d,'error':repr(e)})
             log('V3_DATE_FATAL',date=d,error=repr(e),traceback=traceback.format_exc()[-1800:])
@@ -361,6 +392,8 @@ def main():
         v,p,w,d,ng,lat,exitmode,h=k;s=summarize(g)
         rows.append({'variant':v,'profile':p,'window_ms':w,'direction':d,'net_gate_bp':ng,'latency_ms':lat,
                      'exit_mode':exitmode,'horizon_ms':h,**s})
+    for (p,w,d),g in sorted(funnel.items()):
+        log('V3_FUNNEL',profile=p,window_ms=w,direction=d,**g)
     pos=[r for r in rows if r['direction']==1 and r['n']>0]
     sample_stats={'cells_n_gt0':len(pos),
                   'cells_n_ge5':sum(r['n']>=5 for r in pos),
