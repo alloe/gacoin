@@ -36,6 +36,10 @@ BN_FEE_BP=float(os.getenv('PAPER_BN_FEE_BP','5'))
 LAG_GATE_BP=float(os.getenv('PAPER_LAG_GATE_BP','10'))
 EDGE_GATES_BP=[float(x) for x in os.getenv('PAPER_EDGE_GATES_BP','0,10,20').split(',')]
 PAPER_CHUNK_ROWS=int(os.getenv('PAPER_CHUNK_ROWS','25'))
+MIN_CANDIDATE_KRW=int(os.getenv('PAPER_MIN_CANDIDATE_KRW','1000000'))
+TARGET_RESID_BP=float(os.getenv('PAPER_TARGET_RESID_BP','5'))
+STOP_WORSEN_BP=float(os.getenv('PAPER_STOP_WORSEN_BP','30'))
+DYNAMIC_TIMEOUT_MS=int(os.getenv('PAPER_DYNAMIC_TIMEOUT_MS','10000'))
 R=requests.Session();R.headers['User-Agent']='daol-event-sniper-paper/18'
 
 quotes_up={};quotes_bn={};fx=None
@@ -46,6 +50,8 @@ events_total=0
 samples_total=0
 paper_events=0
 paper_stats=defaultdict(lambda:{'n':0,'full':0,'wins':0,'sum_bp':0.0,'sum_pnl':0.0,'sum_fill':0.0})
+dynamic_stats=defaultdict(lambda:{'n':0,'full':0,'wins':0,'sum_bp':0.0,'sum_pnl':0.0,'sum_fill':0.0,
+                                 'targets':0,'stops':0,'timeouts':0})
 start_mono=time.monotonic()
 universe=[]
 bn_symbol={}
@@ -154,6 +160,33 @@ def entry_diag(r,side):
     return {'exec_residual_bp':er,'gross_convergence_bp':gross,
             'up_halfspread_bp':uhalf,'bn_halfspread_bp':bhalf,'est_net_bp':est}
 
+def entry_capacity_krw(r,side):
+    if not r or any(r[i] is None for i in (1,2,3,4,5,6,7,8,9)):return None
+    fxv=float(r[9])
+    if fxv<=0:return None
+    if side==1:
+        return min(float(r[4])*float(r[2]),float(r[7])*float(r[5])*fxv)
+    return min(float(r[3])*float(r[1]),float(r[8])*float(r[6])*fxv)
+
+def dynamic_exit(rows,entry_row,side):
+    d0=entry_diag(entry_row,side)
+    if not d0:return None,None
+    er0=d0['exec_residual_bp'];deadline=entry_row[0]+DYNAMIC_TIMEOUT_MS
+    last=None
+    for r in rows:
+        if r[0]<=entry_row[0]:continue
+        if r[0]>deadline:break
+        last=r;d=entry_diag(r,side)
+        if not d:continue
+        er=d['exec_residual_bp']
+        if side==1:
+            if er>=-TARGET_RESID_BP:return r,'target'
+            if er<=er0-STOP_WORSEN_BP:return r,'stop'
+        else:
+            if er<=TARGET_RESID_BP:return r,'target'
+            if er>=er0+STOP_WORSEN_BP:return r,'stop'
+    return last,'timeout' if last else (None,None)
+
 def replay_cell(er,xr,side,requested_krw):
     if not er or not xr:return None
     need=(1,2,3,4,5,6,7,8,9)
@@ -188,12 +221,16 @@ def evaluate_event(ev):
     if shock is None:return
     side=1 if shock>0 else -1
     route='long_upbit_short_binance' if side==1 else 'inventory_sell_upbit_long_binance'
-    cells=[];eligible_counts={str(int(g)):0 for g in EDGE_GATES_BP}
+    cells=[];dynamic=[];eligible_counts={str(int(g)):0 for g in EDGE_GATES_BP}
+    candidate_lags=[]
     for entry_lag in ENTRY_LAGS_MS:
         er=row_at(rows,ev['trigger_ms']+entry_lag)
-        diag=entry_diag(er,side)
-        if not er or not diag:continue
+        diag=entry_diag(er,side);entry_cap=entry_capacity_krw(er,side)
+        if not er or not diag or entry_cap is None:continue
         lag_ok=lag is not None and ((side==1 and lag>=LAG_GATE_BP) or (side==-1 and lag<=-LAG_GATE_BP))
+        if side==1 and lag_ok and diag['est_net_bp']>=0 and entry_cap>=MIN_CANDIDATE_KRW:
+            candidate_lags.append({'entry_lag_ms':entry_lag,'est_net_bp':diag['est_net_bp'],
+                                   'entry_capacity_krw':entry_cap,'exec_residual_bp':diag['exec_residual_bp']})
         for hold in HOLD_MS:
             xr=row_at(rows,er[0]+hold)
             for amount in SIZES_KRW:
@@ -210,19 +247,41 @@ def evaluate_event(ev):
                             s['n']+=1;s['full']+=1;s['wins']+=rr['net_bp']>0
                             s['sum_bp']+=rr['net_bp'];s['sum_pnl']+=rr['pnl_krw'];s['sum_fill']+=rr['filled_krw']
                             eligible_counts[str(int(gate))]+=1
+        xr_dyn,reason=dynamic_exit(rows,er,side)
+        if xr_dyn:
+            for amount in SIZES_KRW:
+                rr=replay_cell(er,xr_dyn,side,amount)
+                if not rr:continue
+                dynamic.append([entry_lag,xr_dyn[0]-er[0],amount,round(rr['filled_krw'],2),round(rr['fill_ratio'],6),
+                                round(rr['pnl_krw'],2),round(rr['net_bp'],4),round(diag['est_net_bp'],4),
+                                round(diag['exec_residual_bp'],4),reason,bool(lag_ok)])
+                if amount==SIZES_KRW[0] and rr['fill_ratio']>=.95 and side==1 and lag_ok:
+                    for gate in EDGE_GATES_BP:
+                        if diag['est_net_bp']>=gate and entry_cap>=MIN_CANDIDATE_KRW:
+                            key=(gate,entry_lag);s=dynamic_stats[key]
+                            s['n']+=1;s['full']+=1;s['wins']+=rr['net_bp']>0
+                            s['sum_bp']+=rr['net_bp'];s['sum_pnl']+=rr['pnl_krw'];s['sum_fill']+=rr['filled_krw']
+                            s[reason+'s']+=1
     paper_events+=1
     print('PAPER_EVENT_META '+json.dumps({
       'event_id':ev['id'],'coin':ev['coin'],'route':route,'shock_bp':shock,'up_return_bp':upret,'lag_bp':lag,
       'lag_gate_bp':LAG_GATE_BP,'primary_feasible':side==1,
       'fees_bp_per_execution':{'upbit':UP_FEE_BP,'binance_futures':BN_FEE_BP},
       'entry_lags_ms':ENTRY_LAGS_MS,'hold_ms':HOLD_MS,'sizes_krw':SIZES_KRW,
-      'eligible_cell_counts_1m':eligible_counts,
+      'eligible_cell_counts_1m':eligible_counts,'candidate_entry_lags':candidate_lags,
+      'min_candidate_krw':MIN_CANDIDATE_KRW,'dynamic_rule':{'target_residual_bp':TARGET_RESID_BP,
+        'stop_worsen_bp':STOP_WORSEN_BP,'timeout_ms':DYNAMIC_TIMEOUT_MS},
       'cell_schema':['entry_lag_ms','hold_ms','requested_krw','filled_krw','fill_ratio','pnl_krw','net_bp',
                      'entry_est_net_bp','entry_exec_residual_bp','lag_ok'],
-      'cells':len(cells)},separators=(',',':')),flush=True)
+      'cells':len(cells),'dynamic_cells':len(dynamic)},separators=(',',':')),flush=True)
     for i in range(0,len(cells),PAPER_CHUNK_ROWS):
         print('PAPER_EVENT_CHUNK '+json.dumps({'event_id':ev['id'],'chunk':i//PAPER_CHUNK_ROWS,
           'rows':cells[i:i+PAPER_CHUNK_ROWS]},separators=(',',':')),flush=True)
+    for i in range(0,len(dynamic),PAPER_CHUNK_ROWS):
+        print('PAPER_DYNAMIC_CHUNK '+json.dumps({'event_id':ev['id'],'chunk':i//PAPER_CHUNK_ROWS,
+          'schema':['entry_lag_ms','elapsed_ms','requested_krw','filled_krw','fill_ratio','pnl_krw','net_bp',
+                    'entry_est_net_bp','entry_exec_residual_bp','exit_reason','lag_ok'],
+          'rows':dynamic[i:i+PAPER_CHUNK_ROWS]},separators=(',',':')),flush=True)
 
 def emit_paper_summary():
     rows=[]
@@ -231,7 +290,14 @@ def emit_paper_summary():
         rows.append({'edge_gate_bp':gate,'entry_lag_ms':lag,'hold_ms':hold,'n':s['n'],
           'win_rate':s['wins']/s['n'],'mean_bp':s['sum_bp']/s['n'],
           'sum_pnl_krw_1m':s['sum_pnl'],'mean_fill_krw':s['sum_fill']/s['n']})
-    print('PAPER_SUMMARY '+json.dumps({'paper_events':paper_events,'primary_cells':rows},separators=(',',':')),flush=True)
+    dyn=[]
+    for (gate,lag),s in sorted(dynamic_stats.items()):
+        if not s['n']:continue
+        dyn.append({'edge_gate_bp':gate,'entry_lag_ms':lag,'n':s['n'],'win_rate':s['wins']/s['n'],
+          'mean_bp':s['sum_bp']/s['n'],'sum_pnl_krw_1m':s['sum_pnl'],'mean_fill_krw':s['sum_fill']/s['n'],
+          'targets':s['targets'],'stops':s['stops'],'timeouts':s['timeouts']})
+    print('PAPER_SUMMARY '+json.dumps({'paper_events':paper_events,'fixed_primary_cells':rows,
+      'dynamic_primary_cells':dyn},separators=(',',':')),flush=True)
 
 def emit_event(ev):
     global events_total
@@ -293,11 +359,25 @@ async def sampler():
             if shock>=TRIGGER_BP and c not in active and tms>=cooldown.get(c,0):
                 reason='500ms' if abs(bn500 or 0)>=abs(bn1000 or 0) else '1000ms'
                 ev_id=f"{tms}-{c}"
+                shock_now=bn500 if reason=='500ms' else bn1000
+                up_now=up500 if reason=='500ms' else up1000
+                side_now=1 if (shock_now or 0)>0 else -1
+                lag_now=(shock_now-up_now) if shock_now is not None and up_now is not None else None
+                diag_now=entry_diag(row,side_now);cap_now=entry_capacity_krw(row,side_now)
+                lag_ok_now=lag_now is not None and ((side_now==1 and lag_now>=LAG_GATE_BP) or (side_now==-1 and lag_now<=-LAG_GATE_BP))
+                candidate_now=bool(side_now==1 and lag_ok_now and diag_now and cap_now is not None and
+                                   diag_now['est_net_bp']>=0 and cap_now>=MIN_CANDIDATE_KRW)
                 active[c]={'id':ev_id,'coin':c,'trigger_wall_ns':wall,'trigger_mono_ns':n,'trigger_ms':tms,
                            'reason':reason,'r500':bn500,'r1000':bn1000,'rows':list(h)}
                 cooldown[c]=tms+COOLDOWN_MS
-                print('EVENT_TRIGGER '+json.dumps({'event_id':ev_id,'coin':c,'reason':reason,'bn500_bp':bn500,
-                    'bn1000_bp':bn1000,'premium_bp':p,'residual_bp':p-common if common is not None else None},separators=(',',':')),flush=True)
+                payload={'event_id':ev_id,'coin':c,'reason':reason,'bn500_bp':bn500,'bn1000_bp':bn1000,
+                         'up_return_bp':up_now,'lag_bp':lag_now,'premium_bp':p,
+                         'residual_bp':p-common if common is not None else None,
+                         'entry_est_net_bp':diag_now['est_net_bp'] if diag_now else None,
+                         'entry_capacity_krw':cap_now,'trade_candidate':candidate_now}
+                print('EVENT_TRIGGER '+json.dumps(payload,separators=(',',':')),flush=True)
+                if candidate_now:
+                    print('TRADE_CANDIDATE '+json.dumps(payload,separators=(',',':')),flush=True)
             if c in active:
                 ev=active[c]
                 if not ev['rows'] or ev['rows'][-1][0]!=row[0]:ev['rows'].append(row)
@@ -352,7 +432,8 @@ async def main():
     print('EVENT_COLLECTOR_START '+json.dumps({'mode':'public_l1_no_orders','n':len(universe),'coins':universe,
       'sample_ms':SAMPLE_MS,'pre_ms':PRE_MS,'post_ms':POST_MS,'trigger_bp':TRIGGER_BP,
       'storage':'Railway logs EVENT_META/EVENT_CHUNK + PAPER_EVENT_*','paper_entry_lags_ms':ENTRY_LAGS_MS,
-      'paper_hold_ms':HOLD_MS,'paper_sizes_krw':SIZES_KRW,'paper_edge_gates_bp':EDGE_GATES_BP},separators=(',',':')),flush=True)
+      'paper_hold_ms':HOLD_MS,'paper_sizes_krw':SIZES_KRW,'paper_edge_gates_bp':EDGE_GATES_BP,
+      'paper_min_candidate_krw':MIN_CANDIDATE_KRW,'paper_dynamic_timeout_ms':DYNAMIC_TIMEOUT_MS},separators=(',',':')),flush=True)
     await asyncio.gather(upbit_ws(),binance_ws(),sampler())
 
 if __name__=='__main__':asyncio.run(main())
