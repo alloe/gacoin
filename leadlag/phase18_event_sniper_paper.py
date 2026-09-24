@@ -40,6 +40,7 @@ MIN_CANDIDATE_KRW=int(os.getenv('PAPER_MIN_CANDIDATE_KRW','1000000'))
 TARGET_RESID_BP=float(os.getenv('PAPER_TARGET_RESID_BP','5'))
 STOP_WORSEN_BP=float(os.getenv('PAPER_STOP_WORSEN_BP','30'))
 DYNAMIC_TIMEOUT_MS=int(os.getenv('PAPER_DYNAMIC_TIMEOUT_MS','10000'))
+ANCHOR_COINS=[x for x in os.getenv('EVENT_PREMIUM_ANCHORS','BTC,ETH,XRP,SOL,DOGE,ADA').split(',') if x]
 R=requests.Session();R.headers['User-Agent']='daol-event-sniper-paper/18'
 
 quotes_up={};quotes_bn={};fx=None
@@ -49,6 +50,8 @@ cooldown={}
 events_total=0
 samples_total=0
 paper_events=0
+edge_candidate_total=0
+trade_candidate_total=0
 paper_stats=defaultdict(lambda:{'n':0,'full':0,'wins':0,'sum_bp':0.0,'sum_pnl':0.0,'sum_fill':0.0})
 dynamic_stats=defaultdict(lambda:{'n':0,'full':0,'wins':0,'sum_bp':0.0,'sum_pnl':0.0,'sum_fill':0.0,
                                  'targets':0,'stops':0,'timeouts':0})
@@ -170,7 +173,7 @@ def entry_capacity_krw(r,side):
 
 def dynamic_exit(rows,entry_row,side):
     d0=entry_diag(entry_row,side)
-    if not d0:return None,None
+    if not d0 or d0['gross_convergence_bp']<=0:return None,None
     er0=d0['exec_residual_bp'];deadline=entry_row[0]+DYNAMIC_TIMEOUT_MS
     last=None
     for r in rows:
@@ -319,7 +322,7 @@ def emit_event(ev):
     print('EVENT_END '+json.dumps({'event_id':ev['id'],'chunks':math.ceil(len(rows)/CHUNK_ROWS)},separators=(',',':')),flush=True)
 
 async def sampler():
-    global fx,samples_total
+    global fx,samples_total,edge_candidate_total,trade_candidate_total
     last_summary=time.monotonic()
     while True:
         tick_start=time.monotonic()
@@ -327,8 +330,8 @@ async def sampler():
         fq=quotes_up.get('USDT')
         if fresh(fq,n,FX_MAX_STALE_MS):fx=fq
         fxm=mid(fx) if fresh(fx,n,FX_MAX_STALE_MS) else None
-        # common premium from all fresh aligned markets
-        prems=[];snap={}
+        # Common Korean premium: prefer a robust median of liquid anchor coins.
+        prems=[];anchor_prems=[];snap={}
         if fxm:
             for c in universe:
                 u=quotes_up.get(c);b=quotes_bn.get(c)
@@ -337,7 +340,8 @@ async def sampler():
                     if um>0 and bm>0:
                         p=math.log(um/(bm*fxm))*10000
                         prems.append(p);snap[c]=(u,b,um,bm,p)
-        common=float(np.median(prems)) if prems else None
+                        if c in ANCHOR_COINS:anchor_prems.append(p)
+        common=float(np.median(anchor_prems)) if len(anchor_prems)>=3 else (float(np.median(prems)) if prems else None)
         for c,(u,b,um,bm,p) in snap.items():
             h=hist[c]
             p500=None;p1000=None
@@ -365,8 +369,10 @@ async def sampler():
                 lag_now=(shock_now-up_now) if shock_now is not None and up_now is not None else None
                 diag_now=entry_diag(row,side_now);cap_now=entry_capacity_krw(row,side_now)
                 lag_ok_now=lag_now is not None and ((side_now==1 and lag_now>=LAG_GATE_BP) or (side_now==-1 and lag_now<=-LAG_GATE_BP))
-                candidate_now=bool(side_now==1 and lag_ok_now and diag_now and cap_now is not None and
-                                   diag_now['est_net_bp']>=0 and cap_now>=MIN_CANDIDATE_KRW)
+                edge_candidate_now=bool(side_now==1 and lag_ok_now and diag_now and diag_now['est_net_bp']>=0)
+                candidate_now=bool(edge_candidate_now and cap_now is not None and cap_now>=MIN_CANDIDATE_KRW)
+                if edge_candidate_now:edge_candidate_total+=1
+                if candidate_now:trade_candidate_total+=1
                 active[c]={'id':ev_id,'coin':c,'trigger_wall_ns':wall,'trigger_mono_ns':n,'trigger_ms':tms,
                            'reason':reason,'r500':bn500,'r1000':bn1000,'rows':list(h)}
                 cooldown[c]=tms+COOLDOWN_MS
@@ -374,8 +380,10 @@ async def sampler():
                          'up_return_bp':up_now,'lag_bp':lag_now,'premium_bp':p,
                          'residual_bp':p-common if common is not None else None,
                          'entry_est_net_bp':diag_now['est_net_bp'] if diag_now else None,
-                         'entry_capacity_krw':cap_now,'trade_candidate':candidate_now}
+                         'entry_capacity_krw':cap_now,'edge_candidate':edge_candidate_now,'trade_candidate':candidate_now}
                 print('EVENT_TRIGGER '+json.dumps(payload,separators=(',',':')),flush=True)
+                if edge_candidate_now:
+                    print('EDGE_CANDIDATE '+json.dumps(payload,separators=(',',':')),flush=True)
                 if candidate_now:
                     print('TRADE_CANDIDATE '+json.dumps(payload,separators=(',',':')),flush=True)
             if c in active:
@@ -385,8 +393,10 @@ async def sampler():
                     emit_event(ev);del active[c]
         if time.monotonic()-last_summary>=SUMMARY_SEC:
             print('COLLECTOR_SUMMARY '+json.dumps({
-              'uptime_sec':time.monotonic()-start_mono,'universe':len(universe),'aligned_now':len(snap),
+              'uptime_sec':time.monotonic()-start_mono,'universe':len(universe),
               'events_total':events_total,'paper_events':paper_events,'active_events':len(active),'samples_total':samples_total,
+              'edge_candidates':edge_candidate_total,'trade_candidates':trade_candidate_total,
+              'aligned_now':len(snap),'anchor_fresh':len(anchor_prems),'premium_anchors':ANCHOR_COINS,
               'fx_fresh':bool(fxm),'fx_max_stale_ms':FX_MAX_STALE_MS,'trigger_bp':TRIGGER_BP},separators=(',',':')),flush=True)
             emit_paper_summary()
             last_summary=time.monotonic()
@@ -433,7 +443,8 @@ async def main():
       'sample_ms':SAMPLE_MS,'pre_ms':PRE_MS,'post_ms':POST_MS,'trigger_bp':TRIGGER_BP,
       'storage':'Railway logs EVENT_META/EVENT_CHUNK + PAPER_EVENT_*','paper_entry_lags_ms':ENTRY_LAGS_MS,
       'paper_hold_ms':HOLD_MS,'paper_sizes_krw':SIZES_KRW,'paper_edge_gates_bp':EDGE_GATES_BP,
-      'paper_min_candidate_krw':MIN_CANDIDATE_KRW,'paper_dynamic_timeout_ms':DYNAMIC_TIMEOUT_MS},separators=(',',':')),flush=True)
+      'paper_min_candidate_krw':MIN_CANDIDATE_KRW,'paper_dynamic_timeout_ms':DYNAMIC_TIMEOUT_MS,
+      'premium_anchors':ANCHOR_COINS},separators=(',',':')),flush=True)
     await asyncio.gather(upbit_ws(),binance_ws(),sampler())
 
 if __name__=='__main__':asyncio.run(main())
